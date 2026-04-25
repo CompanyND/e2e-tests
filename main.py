@@ -31,6 +31,7 @@ DEBUG_RUN          = os.environ.get("DEBUG_RUN", "").lower() == "true"
 # Resetuje se pri restartu — pro persistenci pouzij SQLite
 # ---------------------------------------------------------------------------
 _repo_cache: dict[str, str] = {}
+_config_cache: dict[str, dict] = {}  # repo_slug -> e2e.config.json
 _bb_token_cache: dict = {"token": None, "expires_at": 0.0}
 
 import time
@@ -56,6 +57,50 @@ async def get_bb_token() -> str:
         _bb_token_cache["expires_at"] = time.time() + data.get("expires_in", 7200)
         print(f"[BB] Novy OAuth token ziskan")
         return _bb_token_cache["token"]
+
+
+# ---------------------------------------------------------------------------
+# e2e.config.json
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "urls": {"dev": "http://localhost:4200"},
+}
+
+async def get_e2e_config(repo_slug: str) -> dict:
+    if repo_slug in _config_cache:
+        return _config_cache[repo_slug]
+
+    token = await get_bb_token()
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/main/e2e.config.json",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if resp.is_success:
+                config = resp.json()
+                _config_cache[repo_slug] = config
+                urls = {k: v for k, v in config.get("urls", {}).items() if v}
+                print(f"[BB] Nacten e2e.config.json | URLs: {urls}")
+                return config
+            else:
+                print(f"[BB] e2e.config.json nenalezen (HTTP {resp.status_code}), pouzivam vychozi")
+    except Exception as e:
+        print(f"[BB] Chyba pri nacitani e2e.config.json: {e}")
+
+    return DEFAULT_CONFIG
+
+
+def get_dev_url(config: dict) -> str:
+    urls = config.get("urls", {})
+    # Vezmi prvni neprazdnou URL v poradi: dev, test, prod
+    for env in ("dev", "test", "prod"):
+        url = urls.get(env, "").strip()
+        if url:
+            return url
+    return "http://localhost:4200"
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +250,7 @@ PLAYWRIGHT_SYSTEM_PROMPT = (
 )
 
 
-async def generate_playwright_tests(issue_key: str, summary: str, ac_text: str) -> str:
+async def generate_playwright_tests(issue_key: str, summary: str, ac_text: str, dev_url: str = "http://localhost:4200") -> str:
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
@@ -213,6 +258,8 @@ async def generate_playwright_tests(issue_key: str, summary: str, ac_text: str) 
     }
     user_prompt = (
         f"Generate Playwright TypeScript tests for JIRA ticket {issue_key}: {summary}\n\n"
+        f"Base URL for this project: {dev_url}\n"
+        f"Use process.env.BASE_URL || '{dev_url}' at the top of the file.\n\n"
         f"Acceptance criteria:\n{ac_text}"
     )
     payload = {
@@ -301,13 +348,18 @@ async def webhook(request: Request):
         raise HTTPException(500, f"Nenalezeno e2e-tests repo pro projekt {project_key}")
     _, repo_slug = repo_result
 
+    # Nacti e2e config
+    e2e_config = await get_e2e_config(repo_slug)
+    dev_url = get_dev_url(e2e_config)
+    print(f"[PW] DEV URL: {dev_url}")
+
     if DEBUG_RUN:
-        print(f"[DEBUG_RUN] Preskakuji Claude + commit | repo: {repo_slug}")
-        return JSONResponse({"status": "debug_run", "repo": repo_slug, "ac_length": len(ac_text)})
+        print(f"[DEBUG_RUN] Preskakuji Claude + commit | repo: {repo_slug} | url: {dev_url}")
+        return JSONResponse({"status": "debug_run", "repo": repo_slug, "ac_length": len(ac_text), "dev_url": dev_url})
 
     # Generuj Playwright testy
     print(f"[PW] Generuji Playwright testy pro {issue_key}...")
-    test_code = await generate_playwright_tests(issue_key, summary, ac_text)
+    test_code = await generate_playwright_tests(issue_key, summary, ac_text, dev_url)
     print(f"[PW] Vygenerovano {len(test_code)} znaku kodu")
 
     # Commitni do Bitbucketu
