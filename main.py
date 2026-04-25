@@ -112,21 +112,28 @@ async def find_e2e_repo(project_key: str) -> tuple[str, str] | None:
     headers = {"Authorization": f"Bearer {token}"}
 
     async with httpx.AsyncClient() as client:
-        # Projdi vsechny BB projekty v workspace a hledej ten ktery odpovida JIRA key
+        # Primo hledej BB projekt podle key — efektivnejsi nez listovat vsechny
         resp = await client.get(
-            f"https://api.bitbucket.org/2.0/teams/{BB_WORKSPACE}/projects",
+            f"https://api.bitbucket.org/2.0/workspaces/{BB_WORKSPACE}/projects/{project_key}",
             headers=headers,
             timeout=15,
         )
-        if not resp.is_success:
-            # Zkus novejsi endpoint
-            resp = await client.get(
+        print(f"[BB] Hledani projektu {project_key}: HTTP {resp.status_code}")
+
+        if resp.is_success:
+            bb_project_key = resp.json().get("key")
+            print(f"[BB] Nalezen BB projekt: {resp.json().get('name')} (key: {bb_project_key})")
+            projects = [resp.json()]
+        else:
+            # Fallback — listuj vsechny projekty
+            resp2 = await client.get(
                 f"https://api.bitbucket.org/2.0/workspaces/{BB_WORKSPACE}/projects",
                 headers=headers,
                 timeout=15,
             )
+            projects = resp2.json().get("values", [])
+            print(f"[BB] Fallback - nalezeno {len(projects)} BB projektu: {[p.get('key') for p in projects]}")
 
-        projects = resp.json().get("values", [])
         print(f"[BB] Nalezeno {len(projects)} BB projektu")
 
         # Hledej BB projekt kde key obsahuje JIRA project key
@@ -134,7 +141,8 @@ async def find_e2e_repo(project_key: str) -> tuple[str, str] | None:
         for p in projects:
             if project_key.upper() in p.get("key", "").upper() or project_key.upper() in p.get("name", "").upper():
                 bb_project_key = p.get("key")
-                print(f"[BB] Nalezen BB projekt: {p.get('name')} (key: {bb_project_key})")
+                if len(projects) > 1:
+                    print(f"[BB] Nalezen BB projekt: {p.get('name')} (key: {bb_project_key})")
                 break
 
         if not bb_project_key:
