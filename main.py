@@ -82,8 +82,7 @@ async def get_e2e_config(repo_slug: str) -> dict:
             if resp.is_success:
                 config = resp.json()
                 _config_cache[repo_slug] = config
-                urls = {k: v for k, v in config.get("urls", {}).items() if v}
-                print(f"[BB] Nacten e2e.config.json | URLs: {urls}")
+                print(f"[BB] Nacten e2e.config.json pro {repo_slug}")
                 return config
             else:
                 print(f"[BB] e2e.config.json nenalezen (HTTP {resp.status_code}), pouzivam vychozi")
@@ -93,14 +92,40 @@ async def get_e2e_config(repo_slug: str) -> dict:
     return DEFAULT_CONFIG
 
 
-def get_dev_url(config: dict) -> str:
-    urls = config.get("urls", {})
-    # Vezmi prvni neprazdnou URL v poradi: dev, test, prod
-    for env in ("dev", "test", "prod"):
-        url = urls.get(env, "").strip()
-        if url:
-            return url
-    return "http://localhost:4200"
+def resolve_component(config: dict, jira_components: list[str]) -> tuple[str, str]:
+    """
+    Zjisti slozku a DEV URL podle JIRA component.
+    Vraci (folder, dev_url).
+    """
+    components_map = config.get("components", {})
+    default = config.get("default_component", "")
+
+    # Najdi prvni component z ticketu ktery je v configu
+    component_name = None
+    for c in jira_components:
+        if c in components_map:
+            component_name = c
+            break
+
+    # Fallback na default_component
+    if not component_name:
+        component_name = default
+        if component_name:
+            print(f"[Config] Pouzivam default_component: {component_name}")
+        else:
+            print(f"[Config] Zadny component nenalezen, pouzivam root slozku")
+            # Pokud neni ani default, pouzij root config
+            urls = config.get("urls", {})
+            dev_url = next((urls[e] for e in ("dev", "test", "prod") if urls.get(e, "").strip()), "http://localhost:4200")
+            return "", dev_url
+
+    comp_config = components_map.get(component_name, {})
+    folder = comp_config.get("folder", "")
+    urls = comp_config.get("urls", {})
+    dev_url = next((urls[e] for e in ("dev", "test", "prod") if urls.get(e, "").strip()), "http://localhost:4200")
+
+    print(f"[Config] Component: {component_name} | folder: {folder} | url: {dev_url}")
+    return folder, dev_url
 
 
 # ---------------------------------------------------------------------------
@@ -137,98 +162,12 @@ def get_ac_text(issue_data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Bitbucket repo discovery s cache
+# Bitbucket repo slug — konvence: {project_key.lower()}-e2e-tests
+# Priklad: PRE -> pre-e2e-tests, NDE -> nde-e2e-tests
 # ---------------------------------------------------------------------------
 
-async def find_e2e_repo(project_key: str) -> tuple[str, str] | None:
-    """
-    Najde nebo vytvori e2e-tests repo pro dany JIRA projekt key.
-    Vraci (bb_project_key, repo_slug) nebo None.
-    Cache: project_key -> "BB_PROJECT/repo_slug"
-    """
-    if project_key in _repo_cache:
-        cached = _repo_cache[project_key]
-        bb_project, repo_slug = cached.split("/", 1)
-        print(f"[Cache] {project_key} -> {bb_project}/{repo_slug}")
-        return bb_project, repo_slug
-
-    print(f"[BB] Hledam e2e repo pro projekt {project_key}...")
-    token = await get_bb_token()
-    headers = {"Authorization": f"Bearer {token}"}
-
-    async with httpx.AsyncClient() as client:
-        # Primo hledej BB projekt podle key — efektivnejsi nez listovat vsechny
-        resp = await client.get(
-            f"https://api.bitbucket.org/2.0/workspaces/{BB_WORKSPACE}/projects/{project_key}",
-            headers=headers,
-            timeout=15,
-        )
-        print(f"[BB] Hledani projektu {project_key}: HTTP {resp.status_code}")
-
-        if resp.is_success:
-            bb_project_key = resp.json().get("key")
-            print(f"[BB] Nalezen BB projekt: {resp.json().get('name')} (key: {bb_project_key})")
-            projects = [resp.json()]
-        else:
-            # Fallback — listuj vsechny projekty
-            resp2 = await client.get(
-                f"https://api.bitbucket.org/2.0/workspaces/{BB_WORKSPACE}/projects",
-                headers=headers,
-                timeout=15,
-            )
-            projects = resp2.json().get("values", [])
-            print(f"[BB] Fallback - nalezeno {len(projects)} BB projektu: {[p.get('key') for p in projects]}")
-
-        print(f"[BB] Nalezeno {len(projects)} BB projektu")
-
-        # Hledej BB projekt kde key obsahuje JIRA project key
-        bb_project_key = None
-        for p in projects:
-            if project_key.upper() in p.get("key", "").upper() or project_key.upper() in p.get("name", "").upper():
-                bb_project_key = p.get("key")
-                if len(projects) > 1:
-                    print(f"[BB] Nalezen BB projekt: {p.get('name')} (key: {bb_project_key})")
-                break
-
-        if not bb_project_key:
-            print(f"[BB] BB projekt pro JIRA key {project_key} nenalezen")
-            return None
-
-        # Hledej e2e-tests repo v tomto BB projektu
-        repos_resp = await client.get(
-            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}",
-            headers=headers,
-            params={"q": f'project.key="{bb_project_key}" AND name="e2e-tests"'},
-            timeout=15,
-        )
-        repos = repos_resp.json().get("values", [])
-
-        if repos:
-            repo_slug = repos[0]["slug"]
-            print(f"[BB] Nalezeno e2e repo: {repo_slug}")
-        else:
-            # Repo neexistuje -> vytvor ho
-            print(f"[BB] e2e-tests repo neexistuje, vytvarim...")
-            create_resp = await client.post(
-                f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/e2e-tests-{project_key.lower()}",
-                headers={**headers, "Content-Type": "application/json"},
-                json={
-                    "scm": "git",
-                    "is_private": True,
-                    "project": {"key": bb_project_key},
-                    "name": "e2e-tests",
-                },
-                timeout=15,
-            )
-            if not create_resp.is_success:
-                print(f"[BB] Chyba pri vytvareni repo: {create_resp.text}")
-                return None
-            repo_slug = create_resp.json()["slug"]
-            print(f"[BB] Vytvoreno repo: {repo_slug}")
-
-        # Uloz do cache
-        _repo_cache[project_key] = f"{bb_project_key}/{repo_slug}"
-        return bb_project_key, repo_slug
+def get_e2e_repo_slug(project_key: str) -> str:
+    return f"{project_key.lower()}-e2e-tests"
 
 
 # ---------------------------------------------------------------------------
@@ -283,10 +222,11 @@ async def generate_playwright_tests(issue_key: str, summary: str, ac_text: str, 
 # Bitbucket - commit souboru
 # ---------------------------------------------------------------------------
 
-async def commit_playwright_test(repo_slug: str, issue_key: str, content: str) -> bool:
-    """Commitne .spec.ts soubor do e2e repo."""
+async def commit_playwright_test(repo_slug: str, issue_key: str, content: str, folder: str = "") -> bool:
+    """Commitne .spec.ts soubor do e2e repo do spravne slozky."""
     token = await get_bb_token()
-    filename = f"{issue_key}.spec.ts"
+    # Sestaveni cesty: components/PRE-294.spec.ts nebo PRE-294.spec.ts
+    filepath = f"{folder}/{issue_key}.spec.ts" if folder else f"{issue_key}.spec.ts"
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -296,12 +236,12 @@ async def commit_playwright_test(repo_slug: str, issue_key: str, content: str) -
                 "message": f"feat: Playwright testy pro {issue_key} [auto-generated]",
                 "branch": "main",
                 "author": "E2E Test Agent <e2e-agent@netdirect.cz>",
-                filename: content,
+                filepath: content,
             },
             timeout=30,
         )
         if resp.is_success:
-            print(f"[BB] Commitnuto: {filename} do {repo_slug}")
+            print(f"[BB] Commitnuto: {filepath} do {repo_slug}")
             return True
         else:
             print(f"[BB] Chyba commitu: {resp.status_code} {resp.text[:200]}")
@@ -334,6 +274,8 @@ async def webhook(request: Request):
     fields     = issue_data.get("fields", {})
     summary    = fields.get("summary", "")
     project_key = issue_key.split("-")[0]
+    jira_components = [c.get("name", "") for c in fields.get("components", [])]
+    print(f"[JIRA] Components: {jira_components if jira_components else 'zadne'}")
 
     # Vytahni AK z custom fieldu
     ac_text = get_ac_text(issue_data)
@@ -343,28 +285,26 @@ async def webhook(request: Request):
 
     print(f"[PW] AK nalezena ({len(ac_text)} znaku) | Hledam e2e repo...")
 
-    # Najdi e2e repo
-    repo_result = await find_e2e_repo(project_key)
-    if not repo_result:
-        raise HTTPException(500, f"Nenalezeno e2e-tests repo pro projekt {project_key}")
-    _, repo_slug = repo_result
+    # Repo slug — konvence: pre-e2e-tests, nde-e2e-tests atd.
+    repo_slug = get_e2e_repo_slug(project_key)
+    print(f"[BB] E2E repo: {repo_slug}")
 
-    # Nacti e2e config
+    # Nacti e2e config a zjisti component
     e2e_config = await get_e2e_config(repo_slug)
-    dev_url = get_dev_url(e2e_config)
-    print(f"[PW] DEV URL: {dev_url}")
+    folder, dev_url = resolve_component(e2e_config, jira_components)
+    print(f"[PW] Slozka: {folder or 'root'} | DEV URL: {dev_url}")
 
     if DEBUG_RUN:
-        print(f"[DEBUG_RUN] Preskakuji Claude + commit | repo: {repo_slug} | url: {dev_url}")
-        return JSONResponse({"status": "debug_run", "repo": repo_slug, "ac_length": len(ac_text), "dev_url": dev_url})
+        print(f"[DEBUG_RUN] Preskakuji Claude + commit | repo: {repo_slug} | folder: {folder} | url: {dev_url}")
+        return JSONResponse({"status": "debug_run", "repo": repo_slug, "folder": folder, "dev_url": dev_url})
 
     # Generuj Playwright testy
     print(f"[PW] Generuji Playwright testy pro {issue_key}...")
     test_code = await generate_playwright_tests(issue_key, summary, ac_text, dev_url)
     print(f"[PW] Vygenerovano {len(test_code)} znaku kodu")
 
-    # Commitni do Bitbucketu
-    success = await commit_playwright_test(repo_slug, issue_key, test_code)
+    # Commitni do Bitbucketu do spravne slozky
+    success = await commit_playwright_test(repo_slug, issue_key, test_code, folder)
     if not success:
         raise HTTPException(500, "Chyba pri commitu do Bitbucketu")
 
