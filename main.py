@@ -215,7 +215,15 @@ async def generate_playwright_tests(issue_key: str, summary: str, ac_text: str, 
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["content"][0]["text"]
+        raw = resp.json()["content"][0]["text"].strip()
+        # Safety net — odstran markdown code fence pokud Claude pridal navzdory instrukci
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            lines = lines[1:]  # odstran prvni radek s ```typescript
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]  # odstran posledni ```
+            raw = "\n".join(lines)
+        return raw
 
 
 # ---------------------------------------------------------------------------
