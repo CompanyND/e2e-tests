@@ -176,6 +176,7 @@ async def get_pr_diff_files(repo_slug: str, pr_id: int) -> list[tuple[str, str]]
             f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/pullrequests/{pr_id}/diffstat",
             headers={"Authorization": f"Bearer {token}"},
             timeout=15,
+            follow_redirects=True,
         )
         if not diff_resp.is_success:
             print(f"[BB] diffstat chyba: {diff_resp.status_code}")
