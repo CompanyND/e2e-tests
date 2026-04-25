@@ -261,7 +261,13 @@ async def generate_playwright_tests(
         parts = []
         for filepath, file_content in source_files:
             parts.append(f"=== {filepath} ===\n{file_content}")
-        source_context = "\n\nSource code of changed files (use these for accurate selectors):\n" + "\n\n".join(parts)
+        source_context = (
+            "\n\nThe following Angular source files were changed in the PR for this ticket. "
+            "Use them to extract REAL selectors, component structure, routes, and data bindings. "
+            "Look for: HTML element IDs, data-testid attributes, Angular component selectors, "
+            "router links, form control names, and any identifiers you can use in Playwright selectors.\n\n"
+            + "\n\n".join(parts)
+        )
 
     user_prompt = (
         f"Generate Playwright TypeScript tests for JIRA ticket {issue_key}: {summary}\n\n"
