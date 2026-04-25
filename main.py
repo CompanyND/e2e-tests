@@ -295,7 +295,7 @@ async def commit_playwright_test(repo_slug: str, issue_key: str, content: str) -
             data={
                 "message": f"feat: Playwright testy pro {issue_key} [auto-generated]",
                 "branch": "main",
-                "author": "E2E Test Agent",
+                "author": "E2E Test Agent <e2e-agent@netdirect.cz>",
                 filename: content,
             },
             timeout=30,
