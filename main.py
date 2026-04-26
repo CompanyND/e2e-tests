@@ -160,7 +160,7 @@ async def get_linked_pr(issue_id: str) -> tuple[str, int] | None:
         merged = [pr for pr in prs if pr.get("status") == "MERGED"]
         if not merged:
             merged = prs
-        pr = merged[-1]
+        pr = merged[0]  # nejnovejsi MERGED PR
         repo_name = pr.get("repositoryName", "")
         pr_id = pr.get("id")
         repo_slug = repo_name.split("/")[-1] if "/" in repo_name else repo_name
@@ -189,7 +189,10 @@ async def get_pr_diff_files(repo_slug: str, pr_id: int) -> list[tuple[str, str]]
             if not filepath:
                 continue
             ext = filepath.split(".")[-1]
-            if ext not in ("html", "ts") or filepath.endswith(".spec.ts"):
+            if ext not in ("html", "ts", "cshtml", "razor", "cs") or filepath.endswith(".spec.ts"):
+                continue
+            # Preskoc .cs soubory ktere nejsou komponenty (napr. migrations, tests)
+            if ext == "cs" and any(x in filepath.lower() for x in ("migration", "test", "spec", ".designer.")):
                 continue
             try:
                 src_resp = await client.get(
