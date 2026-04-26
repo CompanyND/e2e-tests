@@ -336,10 +336,15 @@ PLAYWRIGHT_SYSTEM_PROMPT = (
     "12. For JSON-LD: page.locator('script[type=\"application/ld+json\"]') + page.evaluate(). "
     "13. Angular components: page.locator('app-breadcrumb'), page.locator('cmp-header'). "
     "14. CSS cannot match text — never use [text*=...] in CSS selectors. "
+    "15. If locator matches multiple elements use .first() or .nth(0) or .filter({ hasText: }) to target specific one. "
+    "16. When using page.evaluate() on script tags always handle null/undefined: const data = JSON.parse(content || 'null'); if (!data) return undefined; "
     "SOURCE CODE RULES: "
-    "15. If source code provided: use ONLY real selectors (IDs, data-testid, Angular tags). "
-    "16. NEVER invent selectors not in source code. "
-    "17. If no source code: use semantic selectors and add // TODO: verify selector comments. "
+    "17. If source code provided: use ONLY real selectors (IDs, data-testid, Angular tags). "
+    "18. NEVER invent selectors not in source code. "
+    "19. If no source code: use semantic selectors and add // TODO: verify selector comments. "
+    "TECH STACK RULES: "
+    "20. If Angular version provided: use standalone components for v17+, NgModule for older. "
+    "21. If .NET version provided: adjust API endpoint patterns accordingly. "
 )
 
 
