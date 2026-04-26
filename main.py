@@ -211,57 +211,91 @@ async def get_pr_diff_files(repo_slug: str, pr_id: int) -> list[tuple[str, str]]
 # Stack verze detekce (Angular, .NET)
 # ---------------------------------------------------------------------------
 
+async def _fetch_json_file(client: httpx.AsyncClient, repo_slug: str, token: str, path: str) -> dict | None:
+    url = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/HEAD/{path}"
+    resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    if not resp.is_success:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+async def _list_dir(client: httpx.AsyncClient, repo_slug: str, token: str, path: str = "") -> list[dict]:
+    all_values = []
+    url = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/HEAD/{path}?pagelen=100"
+    while url:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        if not resp.is_success:
+            break
+        data = resp.json()
+        all_values.extend(data.get("values", []))
+        url = data.get("next")
+    return all_values
+
+
 async def detect_stack_versions(repo_slug: str, pr_id: int) -> dict:
-    """Detekuje verze Angular a .NET z repo souboru."""
+    """Detekuje verze Angular a .NET — hledá v rootu i podslozkach."""
     token = await get_bb_token()
     versions = {"angular": "", "dotnet": ""}
 
-    async with httpx.AsyncClient() as client:
-        # Angular verze z package.json
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        # Angular — root + podsložky (FlexMvc/, AdminMvc/ atd.)
         try:
-            resp = await client.get(
-                f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/HEAD/package.json",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-                follow_redirects=True,
-            )
-            if resp.is_success:
-                pkg = resp.json()
-                ng_ver = pkg.get("dependencies", {}).get("@angular/core", "")
-                if not ng_ver:
-                    ng_ver = pkg.get("devDependencies", {}).get("@angular/core", "")
-                if ng_ver:
-                    match = re.search(r"(\d+)", ng_ver)
-                    if match:
-                        versions["angular"] = match.group(1)
-                        print(f"[Stack] Angular v{versions['angular']} detekovan")
+            candidates = ["package.json"]
+            root_files = await _list_dir(client, repo_slug, token)
+            for f in root_files:
+                if f.get("type") == "commit_directory":
+                    candidates.append(f"{f['path']}/package.json")
+
+            seen_versions = set()
+            for path in candidates:
+                pkg = await _fetch_json_file(client, repo_slug, token, path)
+                if not pkg:
+                    continue
+                deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                version = deps.get("@angular/core", "")
+                if not version:
+                    continue
+                match = re.search(r"(\d+)", version)
+                if match:
+                    seen_versions.add(match.group(1))
+
+            if seen_versions:
+                versions["angular"] = str(max(int(v) for v in seen_versions))
+                print(f"[Stack] Angular v{versions['angular']} detekovan")
+            else:
+                versions["angular"] = "6"  # fallback pro starsi projekty
+                print(f"[Stack] Angular verze nenalezena, pouzivam fallback v6")
         except Exception as e:
             print(f"[Stack] Chyba pri detekci Angular: {e}")
 
-        # .NET verze z *.csproj souboru v diffu
+        # .NET — z .csproj souboru v rootu i podslozkach
         try:
-            diff_resp = await client.get(
-                f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/pullrequests/{pr_id}/diffstat",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15,
-                follow_redirects=True,
-            )
-            if diff_resp.is_success:
-                for f in diff_resp.json().get("values", []):
-                    path = f.get("new", {}).get("path", "") or f.get("old", {}).get("path", "")
-                    if path.endswith(".csproj"):
-                        csproj_resp = await client.get(
-                            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/HEAD/{path}",
-                            headers={"Authorization": f"Bearer {token}"},
-                            timeout=10,
-                            follow_redirects=True,
-                        )
-                        if csproj_resp.is_success:
-                            match = re.search(r"<TargetFramework>net(\d+)", csproj_resp.text)
-                            if match:
-                                versions["dotnet"] = match.group(1)
-                                print(f"[Stack] .NET {versions['dotnet']} detekovan")
-                                break
+            all_files = await _list_dir(client, repo_slug, token)
+            csproj_paths = []
+            for f in all_files:
+                if f.get("path", "").endswith(".csproj"):
+                    csproj_paths.append(f["path"])
+                elif f.get("type") == "commit_directory":
+                    sub_files = await _list_dir(client, repo_slug, token, f["path"])
+                    for sf in sub_files:
+                        if sf.get("path", "").endswith(".csproj"):
+                            csproj_paths.append(sf["path"])
+
+            for path in csproj_paths:
+                resp = await client.get(
+                    f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/HEAD/{path}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                if resp.is_success:
+                    match = re.search(r"<TargetFramework>net(\d+)", resp.text)
+                    if match:
+                        versions["dotnet"] = match.group(1)
+                        print(f"[Stack] .NET {versions['dotnet']} detekovan")
+                        break
         except Exception as e:
             print(f"[Stack] Chyba pri detekci .NET: {e}")
 
