@@ -9,6 +9,7 @@ Pozadavky: fastapi, httpx, uvicorn
 from __future__ import annotations
 
 import os
+import re
 import json
 import base64
 import httpx
@@ -207,6 +208,67 @@ async def get_pr_diff_files(repo_slug: str, pr_id: int) -> list[tuple[str, str]]
 
 
 # ---------------------------------------------------------------------------
+# Stack verze detekce (Angular, .NET)
+# ---------------------------------------------------------------------------
+
+async def detect_stack_versions(repo_slug: str, pr_id: int) -> dict:
+    """Detekuje verze Angular a .NET z repo souboru."""
+    token = await get_bb_token()
+    versions = {"angular": "", "dotnet": ""}
+
+    async with httpx.AsyncClient() as client:
+        # Angular verze z package.json
+        try:
+            resp = await client.get(
+                f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/HEAD/package.json",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+                follow_redirects=True,
+            )
+            if resp.is_success:
+                pkg = resp.json()
+                ng_ver = pkg.get("dependencies", {}).get("@angular/core", "")
+                if not ng_ver:
+                    ng_ver = pkg.get("devDependencies", {}).get("@angular/core", "")
+                if ng_ver:
+                    match = re.search(r"(\d+)", ng_ver)
+                    if match:
+                        versions["angular"] = match.group(1)
+                        print(f"[Stack] Angular v{versions['angular']} detekovan")
+        except Exception as e:
+            print(f"[Stack] Chyba pri detekci Angular: {e}")
+
+        # .NET verze z *.csproj souboru v diffu
+        try:
+            diff_resp = await client.get(
+                f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/pullrequests/{pr_id}/diffstat",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+                follow_redirects=True,
+            )
+            if diff_resp.is_success:
+                for f in diff_resp.json().get("values", []):
+                    path = f.get("new", {}).get("path", "") or f.get("old", {}).get("path", "")
+                    if path.endswith(".csproj"):
+                        csproj_resp = await client.get(
+                            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/HEAD/{path}",
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=10,
+                            follow_redirects=True,
+                        )
+                        if csproj_resp.is_success:
+                            match = re.search(r"<TargetFramework>net(\d+)", csproj_resp.text)
+                            if match:
+                                versions["dotnet"] = match.group(1)
+                                print(f"[Stack] .NET {versions['dotnet']} detekovan")
+                                break
+        except Exception as e:
+            print(f"[Stack] Chyba pri detekci .NET: {e}")
+
+    return versions
+
+
+# ---------------------------------------------------------------------------
 # Repo slug konvence
 # ---------------------------------------------------------------------------
 
@@ -223,24 +285,27 @@ PLAYWRIGHT_SYSTEM_PROMPT = (
     "Generate a complete Playwright TypeScript test file based on acceptance criteria. "
     "CRITICAL OUTPUT RULE: "
     "Your response must start EXACTLY with the character 'i' from 'import'. "
-    "Do NOT include any markdown, no backticks, no code fences, no ```typescript, no explanations. "
-    "If your response does not start with 'import', it is WRONG. "
-    "CODE RULES: "
-    "1. First line must be: import { test, expect } from '@playwright/test'; "
+    "Do NOT include markdown, backticks, code fences, or explanations. "
+    "STRUCTURE RULES: "
+    "1. First line: import { test, expect } from '@playwright/test'; "
     "2. Second line: const BASE_URL = process.env.BASE_URL || 'PROVIDED_URL'; "
-    "3. Use test.describe() per [SCENARIO] — name matches the scenario name exactly. "
-    "4. Inside describe: one test() per logical check. "
-    "5. [GIVEN] = await page.goto() and precondition setup. "
-    "6. [WHEN] = user interactions: click, fill, select, press. "
-    "7. [THEN] and [AND] = await expect() assertions. "
-    "8. For any UI scenario: add a separate test.describe block with mobile viewport (375x667) using page.setViewportSize(). "
-    "9. If source code is provided: extract REAL selectors from the HTML/TS files. "
-    "   Use data-testid attributes, element IDs, ARIA roles, or Angular component selectors found in the code. "
-    "   NEVER invent selectors that do not exist in the provided source code. "
-    "10. If no source code: use getByRole(), getByLabel(), getByPlaceholder() as best guesses. "
-    "11. Never hardcode URLs — always use BASE_URL. "
-    "12. Add await page.waitForLoadState('networkidle') after navigation when needed. "
-    "13. Use test.beforeEach() for repeated setup within a describe block. "
+    "3. Use test.describe() per [SCENARIO]. "
+    "4. [GIVEN]=page.goto()+setup. [WHEN]=user actions. [THEN]/[AND]=expect() assertions. "
+    "5. For UI scenarios add mobile test.describe with page.setViewportSize({ width: 375, height: 667 }). "
+    "6. Use test.beforeEach() for repeated setup. Never hardcode URLs. "
+    "7. Add page.waitForLoadState('networkidle') after navigation. "
+    "SELECTOR RULES (critical): "
+    "8. Priority: getByTestId() > getByRole() > getByLabel() > getByPlaceholder() > locator(). "
+    "9. For text matching use: page.getByText('text') or page.locator(':text(\"text\")'. "
+    "10. NEVER use text*= or text~= inside locator() — invalid Playwright syntax. "
+    "11. Use .filter({ hasText: 'text' }) NOT .filter({ has: locator('text*=...') }). "
+    "12. For JSON-LD: page.locator('script[type=\"application/ld+json\"]') + page.evaluate(). "
+    "13. Angular components: page.locator('app-breadcrumb'), page.locator('cmp-header'). "
+    "14. CSS cannot match text — never use [text*=...] in CSS selectors. "
+    "SOURCE CODE RULES: "
+    "15. If source code provided: use ONLY real selectors (IDs, data-testid, Angular tags). "
+    "16. NEVER invent selectors not in source code. "
+    "17. If no source code: use semantic selectors and add // TODO: verify selector comments. "
 )
 
 
@@ -250,6 +315,7 @@ async def generate_playwright_tests(
     ac_text: str,
     dev_url: str = "http://localhost:4200",
     source_files: list[tuple[str, str]] | None = None,
+    stack_versions: dict | None = None,
 ) -> str:
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
@@ -269,10 +335,21 @@ async def generate_playwright_tests(
             + "\n\n".join(parts)
         )
 
+    stack_info = ""
+    if stack_versions:
+        parts = []
+        if stack_versions.get("angular"):
+            parts.append(f"Angular v{stack_versions['angular']}")
+        if stack_versions.get("dotnet"):
+            parts.append(f".NET {stack_versions['dotnet']}")
+        if parts:
+            stack_info = f"\nTech stack: {', '.join(parts)}. Use version-appropriate patterns."
+
     user_prompt = (
         f"Generate Playwright TypeScript tests for JIRA ticket {issue_key}: {summary}\n\n"
         f"Base URL for this project: {dev_url}\n"
-        f"Use process.env.BASE_URL || '{dev_url}' at the top of the file.\n\n"
+        f"Use process.env.BASE_URL || '{dev_url}' at the top of the file."
+        f"{stack_info}\n\n"
         f"Acceptance criteria:\n{ac_text}"
         f"{source_context}"
     )
@@ -382,12 +459,19 @@ async def webhook(request: Request):
         else:
             print(f"[PW] Zadne linked PR — generuji bez source kontextu")
 
-    if DEBUG_RUN:
-        print(f"[DEBUG_RUN] repo: {repo_slug} | folder: {folder} | url: {dev_url} | source files: {len(source_files)}")
-        return JSONResponse({"status": "debug_run", "repo": repo_slug, "folder": folder, "dev_url": dev_url, "source_files": len(source_files)})
+    # Detekuj stack verze
+    stack_versions = {}
+    if issue_id and source_files:
+        pr_result2 = await get_linked_pr(issue_id)
+        if pr_result2:
+            stack_versions = await detect_stack_versions(pr_result2[0], pr_result2[1])
 
-    print(f"[PW] Generuji Playwright testy pro {issue_key} | source files: {len(source_files)}...")
-    test_code = await generate_playwright_tests(issue_key, summary, ac_text, dev_url, source_files)
+    if DEBUG_RUN:
+        print(f"[DEBUG_RUN] repo: {repo_slug} | folder: {folder} | url: {dev_url} | source files: {len(source_files)} | stack: {stack_versions}")
+        return JSONResponse({"status": "debug_run", "repo": repo_slug, "folder": folder, "dev_url": dev_url, "source_files": len(source_files), "stack": stack_versions})
+
+    print(f"[PW] Generuji Playwright testy pro {issue_key} | source files: {len(source_files)} | stack: {stack_versions}...")
+    test_code = await generate_playwright_tests(issue_key, summary, ac_text, dev_url, source_files, stack_versions)
     print(f"[PW] Vygenerovano {len(test_code)} znaku kodu")
 
     success = await commit_playwright_test(repo_slug, issue_key, test_code, folder)
