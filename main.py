@@ -160,7 +160,8 @@ async def get_linked_pr(issue_id: str) -> tuple[str, int] | None:
         merged = [pr for pr in prs if pr.get("status") == "MERGED"]
         if not merged:
             merged = prs
-        pr = merged[0]  # nejnovejsi MERGED PR
+        # Vezmi PR s nejnovejsim lastUpdate datem
+        pr = max(merged, key=lambda p: p.get("lastUpdate", ""))
         repo_name = pr.get("repositoryName", "")
         pr_id = pr.get("id")
         repo_slug = repo_name.split("/")[-1] if "/" in repo_name else repo_name
@@ -170,7 +171,6 @@ async def get_linked_pr(issue_id: str) -> tuple[str, int] | None:
 
 async def get_pr_diff_files(repo_slug: str, pr_id: int) -> list[tuple[str, str]]:
     token = await get_bb_token()
-    MAX_CHARS = 8000
     files_content = []
     async with httpx.AsyncClient() as client:
         diff_resp = await client.get(
@@ -189,10 +189,7 @@ async def get_pr_diff_files(repo_slug: str, pr_id: int) -> list[tuple[str, str]]
             if not filepath:
                 continue
             ext = filepath.split(".")[-1]
-            if ext not in ("html", "ts", "cshtml", "razor", "cs") or filepath.endswith(".spec.ts"):
-                continue
-            # Preskoc .cs soubory ktere nejsou komponenty (napr. migrations, tests)
-            if ext == "cs" and any(x in filepath.lower() for x in ("migration", "test", "spec", ".designer.")):
+            if ext not in ("html", "ts") or filepath.endswith(".spec.ts"):
                 continue
             try:
                 src_resp = await client.get(
@@ -202,7 +199,7 @@ async def get_pr_diff_files(repo_slug: str, pr_id: int) -> list[tuple[str, str]]
                     follow_redirects=True,
                 )
                 if src_resp.is_success:
-                    file_content = src_resp.text[:MAX_CHARS]
+                    file_content = src_resp.text  # bez limitu
                     files_content.append((filepath, file_content))
                     print(f"[BB] Stazeno: {filepath} ({len(file_content)} znaku)")
             except Exception as e:
