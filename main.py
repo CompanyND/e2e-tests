@@ -570,8 +570,8 @@ async def generate_playwright_tests(
         f"{previous_context}"
     )
     payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 4096,
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 8192,
         "system": PLAYWRIGHT_SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_prompt}],
     }
