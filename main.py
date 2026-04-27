@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import re
 import json
-import base64
+import time
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -27,17 +27,19 @@ BB_OAUTH_CLIENT_SECRET = os.environ.get("BB_OAUTH_CLIENT_SECRET", "")
 BB_WORKSPACE           = os.environ.get("BB_WORKSPACE", "netdirect-custom-solution")
 DEBUG_RUN              = os.environ.get("DEBUG_RUN", "").lower() == "true"
 
+# Bot author identifikator — pouziva se pro detekci rucnich commitu
+BOT_AUTHOR_EMAIL = "e2e-agent@netdirect.cz"
+AI_BRANCH_PREFIX = "ai-generated"
+
 _config_cache: dict[str, dict] = {}
 _bb_token_cache: dict = {"token": None, "expires_at": 0.0}
 
-import time
 
 # ---------------------------------------------------------------------------
 # Bitbucket OAuth
 # ---------------------------------------------------------------------------
 
 async def get_bb_token() -> str:
-    import time
     if _bb_token_cache["token"] and time.time() < _bb_token_cache["expires_at"] - 60:
         return _bb_token_cache["token"]
     async with httpx.AsyncClient() as client:
@@ -160,7 +162,6 @@ async def get_linked_pr(issue_id: str) -> tuple[str, int] | None:
         merged = [pr for pr in prs if pr.get("status") == "MERGED"]
         if not merged:
             merged = prs
-        # Vezmi PR s nejnovejsim lastUpdate datem
         pr = max(merged, key=lambda p: p.get("lastUpdate", ""))
         repo_name = pr.get("repositoryName", "")
         pr_id = pr.get("id")
@@ -199,7 +200,7 @@ async def get_pr_diff_files(repo_slug: str, pr_id: int) -> list[tuple[str, str]]
                     follow_redirects=True,
                 )
                 if src_resp.is_success:
-                    file_content = src_resp.text  # bez limitu
+                    file_content = src_resp.text
                     files_content.append((filepath, file_content))
                     print(f"[BB] Stazeno: {filepath} ({len(file_content)} znaku)")
             except Exception as e:
@@ -311,6 +312,150 @@ def get_e2e_repo_slug(project_key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Bitbucket - branch helpers
+# ---------------------------------------------------------------------------
+
+async def get_branch_head_hash(client: httpx.AsyncClient, repo_slug: str, branch: str, token: str) -> str | None:
+    """Vrati hash HEAD commitu na dane vetvi, nebo None pokud vetev neexistuje."""
+    resp = await client.get(
+        f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/refs/branches/{branch}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    if resp.status_code == 404:
+        return None
+    if not resp.is_success:
+        print(f"[BB] refs/branches/{branch} chyba: {resp.status_code} {resp.text[:200]}")
+        return None
+    return resp.json().get("target", {}).get("hash")
+
+
+async def fetch_file_from_branch(repo_slug: str, branch: str, filepath: str, token: str) -> str | None:
+    """Stahne obsah souboru z dane vetve. Vraci None pokud soubor nebo vetev neexistuje."""
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.get(
+            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src/{branch}/{filepath}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        if resp.status_code == 404:
+            return None
+        if not resp.is_success:
+            print(f"[BB] fetch_file_from_branch chyba: {resp.status_code}")
+            return None
+        return resp.text
+
+
+async def has_human_commit(repo_slug: str, branch: str, filepath: str, token: str) -> bool:
+    """
+    Zkontroluje, zda soubor na dane vetvi obsahuje alespon jeden commit
+    od autora jineho nez bot (BOT_AUTHOR_EMAIL).
+    Fail-safe: pri jakekoli chybe vraci True (radeji zachovat nez prepsat).
+    """
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(
+                f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}"
+                f"/filehistory/{branch}/{filepath}?pagelen=50",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+            if not resp.is_success:
+                print(f"[BB] filehistory chyba ({resp.status_code}), fail-safe → predpokladam rucni commit")
+                return True
+            commits = resp.json().get("values", [])
+            for commit in commits:
+                author_raw = commit.get("commit", {}).get("author", {}).get("raw", "")
+                if BOT_AUTHOR_EMAIL not in author_raw:
+                    print(f"[BB] Nalezen rucni commit od: {author_raw!r}")
+                    return True
+            print(f"[BB] Zadny rucni commit nenalezen, soubor je ciste auto-generated")
+            return False
+    except Exception as e:
+        print(f"[BB] has_human_commit vyjimka: {e} — fail-safe → True")
+        return True
+
+
+async def get_previous_test_context(repo_slug: str, issue_key: str, filepath: str) -> str | None:
+    """
+    Rozhodovaci strom:
+      1. Vetev ai-generated/{ISSUE_KEY} neexistuje → None (generuj fresh)
+      2. Vetev existuje, soubor neexistuje → None
+      3. Vetev existuje, soubor existuje, jen auto-commity → None (bot muze prepsat)
+      4. Vetev existuje, soubor existuje, je tam rucni commit → vratit obsah souboru jako kontext
+    """
+    token = await get_bb_token()
+    branch_name = f"{AI_BRANCH_PREFIX}/{issue_key}"
+
+    async with httpx.AsyncClient() as client:
+        branch_hash = await get_branch_head_hash(client, repo_slug, branch_name, token)
+
+    if branch_hash is None:
+        print(f"[Context] Vetev {branch_name} neexistuje → fresh generace")
+        return None
+
+    content = await fetch_file_from_branch(repo_slug, branch_name, filepath, token)
+    if content is None:
+        print(f"[Context] Soubor {filepath} na vetvi {branch_name} neexistuje → fresh generace")
+        return None
+
+    human_edited = await has_human_commit(repo_slug, branch_name, filepath, token)
+    if not human_edited:
+        print(f"[Context] Soubor nema rucni commit → bot muze prepsat")
+        return None
+
+    print(f"[Context] Soubor byl rucne upraven — predavam jako kontext ({len(content)} znaku)")
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Bitbucket - commit souboru do ai-generated vetve
+# ---------------------------------------------------------------------------
+
+async def commit_playwright_test(repo_slug: str, issue_key: str, content: str, folder: str = "") -> tuple[bool, str]:
+    """
+    Commitne test do vetve ai-generated/{ISSUE_KEY}.
+    Pokud vetev neexistuje, vytvori ji z aktualniho HEAD vetve main.
+    Vraci (success, branch_name).
+    """
+    token = await get_bb_token()
+    filepath = f"{folder}/{issue_key}.spec.ts" if folder else f"{issue_key}.spec.ts"
+    branch_name = f"{AI_BRANCH_PREFIX}/{issue_key}"
+
+    async with httpx.AsyncClient() as client:
+        target_hash = await get_branch_head_hash(client, repo_slug, branch_name, token)
+
+        commit_data: dict = {
+            "message": f"feat: Playwright testy pro {issue_key} [auto-generated]",
+            "branch": branch_name,
+            "author": f"E2E Test Agent <{BOT_AUTHOR_EMAIL}>",
+            filepath: content,
+        }
+
+        if target_hash is None:
+            print(f"[BB] Vetev {branch_name} neexistuje, vytvarim z main")
+            main_hash = await get_branch_head_hash(client, repo_slug, "main", token)
+            if not main_hash:
+                print(f"[BB] Nepodarilo se ziskat hash main vetve")
+                return False, branch_name
+            commit_data["parents"] = main_hash
+        else:
+            print(f"[BB] Vetev {branch_name} jiz existuje, pripojuji commit")
+
+        resp = await client.post(
+            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src",
+            headers={"Authorization": f"Bearer {token}"},
+            data=commit_data,
+            timeout=30,
+        )
+        if resp.is_success:
+            print(f"[BB] Commitnuto: {filepath} do {repo_slug} ({branch_name})")
+            return True, branch_name
+        print(f"[BB] Chyba commitu: {resp.status_code} {resp.text[:200]}")
+        return False, branch_name
+
+
+# ---------------------------------------------------------------------------
 # Claude - generovani Playwright testu
 # ---------------------------------------------------------------------------
 
@@ -350,6 +495,14 @@ PLAYWRIGHT_SYSTEM_PROMPT = (
     "TECH STACK RULES: "
     "20. If Angular version provided: use standalone components for v17+, NgModule for older. "
     "21. If .NET version provided: adjust API endpoint patterns accordingly. "
+    "PREVIOUS VERSION RULES (only applies when a previous version is provided): "
+    "22. PRESERVE all selectors (getByTestId, getByRole, locator strings) from the previous version — "
+    "    they have been verified against the real running application by a QA engineer. "
+    "23. PRESERVE existing waitForLoadState, waitForSelector, and other wait strategies. "
+    "24. Do NOT refactor or rename working selectors even if you would choose different ones. "
+    "25. Do NOT remove // TODO comments from the previous version — the engineer left them intentionally. "
+    "26. Only ADD new test.describe blocks for new AC scenarios, or UPDATE scenarios where AC explicitly changed. "
+    "    Do not touch test blocks that still match their AC scenario."
 )
 
 
@@ -360,12 +513,14 @@ async def generate_playwright_tests(
     dev_url: str = "http://localhost:4200",
     source_files: list[tuple[str, str]] | None = None,
     stack_versions: dict | None = None,
+    previous_version: str | None = None,
 ) -> str:
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+
     source_context = ""
     if source_files:
         parts = []
@@ -389,6 +544,22 @@ async def generate_playwright_tests(
         if parts:
             stack_info = f"\nTech stack: {', '.join(parts)}. Use version-appropriate patterns."
 
+    previous_context = ""
+    if previous_version:
+        previous_context = (
+            "\n\nIMPORTANT: A previous version of this test file already exists, "
+            "manually refined by a QA engineer. The selectors and assertions in it "
+            "have been verified against the real running application. "
+            "PRESERVE all selectors (getByTestId, getByRole, locator strings, etc.) "
+            "and wait strategies from the previous version when they cover the same scenario. "
+            "Only ADD new scenarios from updated acceptance criteria, "
+            "or MODIFY scenarios where the AC explicitly changed. "
+            "Do not refactor working code. Do not change selector strategies that already work.\n\n"
+            "=== PREVIOUS VERSION (manually refined by QA engineer) ===\n"
+            f"{previous_version}\n"
+            "=== END PREVIOUS VERSION ==="
+        )
+
     user_prompt = (
         f"Generate Playwright TypeScript tests for JIRA ticket {issue_key}: {summary}\n\n"
         f"Base URL for this project: {dev_url}\n"
@@ -396,6 +567,7 @@ async def generate_playwright_tests(
         f"{stack_info}\n\n"
         f"Acceptance criteria:\n{ac_text}"
         f"{source_context}"
+        f"{previous_context}"
     )
     payload = {
         "model": "claude-sonnet-4-20250514",
@@ -421,32 +593,6 @@ async def generate_playwright_tests(
         if "import" in raw and not raw.startswith("import"):
             raw = raw[raw.index("import"):]
         return raw
-
-
-# ---------------------------------------------------------------------------
-# Bitbucket - commit souboru
-# ---------------------------------------------------------------------------
-
-async def commit_playwright_test(repo_slug: str, issue_key: str, content: str, folder: str = "") -> bool:
-    token = await get_bb_token()
-    filepath = f"{folder}/{issue_key}.spec.ts" if folder else f"{issue_key}.spec.ts"
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo_slug}/src",
-            headers={"Authorization": f"Bearer {token}"},
-            data={
-                "message": f"feat: Playwright testy pro {issue_key} [auto-generated]",
-                "branch": "main",
-                "author": "E2E Test Agent <e2e-agent@netdirect.cz>",
-                filepath: content,
-            },
-            timeout=30,
-        )
-        if resp.is_success:
-            print(f"[BB] Commitnuto: {filepath} do {repo_slug}")
-            return True
-        print(f"[BB] Chyba commitu: {resp.status_code} {resp.text[:200]}")
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +640,7 @@ async def webhook(request: Request):
 
     # Ziskej linked PR a stahni zmenene soubory
     source_files = []
+    pr_result = None
     if issue_id:
         pr_result = await get_linked_pr(issue_id)
         if pr_result:
@@ -503,22 +650,43 @@ async def webhook(request: Request):
         else:
             print(f"[PW] Zadne linked PR — generuji bez source kontextu")
 
-    # Detekuj stack verze
+    # Detekuj stack verze (pouzij uz existujici pr_result, ne duplicitni volani)
     stack_versions = {}
-    if issue_id and source_files:
-        pr_result2 = await get_linked_pr(issue_id)
-        if pr_result2:
-            stack_versions = await detect_stack_versions(pr_result2[0], pr_result2[1])
+    if pr_result and source_files:
+        stack_versions = await detect_stack_versions(pr_result[0], pr_result[1])
+
+    # Ziskej predchozi verzi testu (rozhodovaci strom)
+    filepath = f"{folder}/{issue_key}.spec.ts" if folder else f"{issue_key}.spec.ts"
+    previous_version = await get_previous_test_context(repo_slug, issue_key, filepath)
 
     if DEBUG_RUN:
-        print(f"[DEBUG_RUN] repo: {repo_slug} | folder: {folder} | url: {dev_url} | source files: {len(source_files)} | stack: {stack_versions}")
-        return JSONResponse({"status": "debug_run", "repo": repo_slug, "folder": folder, "dev_url": dev_url, "source_files": len(source_files), "stack": stack_versions})
+        print(
+            f"[DEBUG_RUN] repo: {repo_slug} | folder: {folder} | url: {dev_url} | "
+            f"source files: {len(source_files)} | stack: {stack_versions} | "
+            f"previous_version: {'ano' if previous_version else 'ne'}"
+        )
+        return JSONResponse({
+            "status": "debug_run",
+            "repo": repo_slug,
+            "folder": folder,
+            "dev_url": dev_url,
+            "source_files": len(source_files),
+            "stack": stack_versions,
+            "previous_version_used": previous_version is not None,
+        })
 
-    print(f"[PW] Generuji Playwright testy pro {issue_key} | source files: {len(source_files)} | stack: {stack_versions}...")
-    test_code = await generate_playwright_tests(issue_key, summary, ac_text, dev_url, source_files, stack_versions)
+    print(
+        f"[PW] Generuji Playwright testy pro {issue_key} | "
+        f"source files: {len(source_files)} | stack: {stack_versions} | "
+        f"previous_version: {'ano' if previous_version else 'ne'}..."
+    )
+    test_code = await generate_playwright_tests(
+        issue_key, summary, ac_text, dev_url,
+        source_files, stack_versions, previous_version,
+    )
     print(f"[PW] Vygenerovano {len(test_code)} znaku kodu")
 
-    success = await commit_playwright_test(repo_slug, issue_key, test_code, folder)
+    success, branch_name = await commit_playwright_test(repo_slug, issue_key, test_code, folder)
     if not success:
         raise HTTPException(500, "Chyba pri commitu do Bitbucketu")
 
@@ -526,8 +694,10 @@ async def webhook(request: Request):
         "status": "ok",
         "issue_key": issue_key,
         "repo": repo_slug,
+        "branch": branch_name,
         "file": f"{issue_key}.spec.ts",
         "test_length": len(test_code),
+        "previous_version_used": previous_version is not None,
     })
 
 
@@ -539,4 +709,5 @@ async def health():
         "jira": "ok" if all([JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN]) else "missing",
         "bitbucket": "ok" if all([BB_OAUTH_CLIENT_ID, BB_OAUTH_CLIENT_SECRET]) else "missing",
         "workspace": BB_WORKSPACE,
+        "ai_branch_prefix": AI_BRANCH_PREFIX,
     }
